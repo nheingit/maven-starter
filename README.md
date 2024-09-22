@@ -29,7 +29,7 @@ This project consists of a FastAPI backend and a React frontend using Bun.
 
 4. Start the FastAPI server:
    ```
-   poetry run uvicorn app.main:app --reload
+   poetry run fastapi run app/main.py
    ```
    The backend will be available at `http://localhost:8000`.
 
