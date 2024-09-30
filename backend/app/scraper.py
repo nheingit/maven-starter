@@ -15,17 +15,18 @@ def scrape_hexdoc(url):
     visited_urls = set()
     to_visit = [url]
     app_info = None
+    max_links = 50  # Set the maximum number of links to scrape
 
     with get_db() as conn:
         cursor = conn.cursor()
         
-        while to_visit:
+        while to_visit and len(visited_urls) < max_links:
             current_url = to_visit.pop(0)
             if current_url in visited_urls:
                 continue
 
             visited_urls.add(current_url)
-            logger.info(f"Scraping: {current_url}")
+            logger.info(f"Scraping: {current_url} ({len(visited_urls)}/{max_links})")
 
             try:
                 response = requests.get(current_url, timeout=10)
@@ -37,24 +38,13 @@ def scrape_hexdoc(url):
                     app_info = extract_app_info(soup, cursor)
                     logger.info(f"Extracted application info: {app_info}")
                 
+                if app_info and f'/{library_path}/' in current_url:
+                    module_info = extract_module_info(soup, current_url, app_info['id'], cursor)
+                    logger.info(f"Extracted module info: {module_info}")
+
                 new_links = extract_hexdoc_links(soup, base_url, library_path)
                 logger.info(f"Extracted {len(new_links)} new links to visit")
                 to_visit.extend([link for link in new_links if link not in visited_urls])
-
-                if f'/{library_path}/' in current_url:
-                    if 'modules' in current_url:
-                        module_info = extract_module_info(soup, current_url, app_info['id'], cursor)
-                        logger.info(f"Extracted module info: {module_info}")
-                        
-                        # Log function information
-                        function_sections = soup.find_all('section', class_='function')
-                        logger.info(f"Found {len(function_sections)} function sections")
-                        for func_section in function_sections:
-                            func_info = extract_function_info(func_section, module_info['id'], cursor)
-                            logger.info(f"Extracted function info: {func_info}")
-                    elif any(keyword in current_url for keyword in ['guides', 'readme', 'extras']):
-                        guide_info = extract_guide_info(soup, current_url, app_info['id'], cursor)
-                        logger.info(f"Extracted guide info: {guide_info}")
 
                 # Add a small delay to avoid overwhelming the server
                 time.sleep(0.5)
@@ -62,10 +52,33 @@ def scrape_hexdoc(url):
             except requests.RequestException as e:
                 logger.error(f"Error accessing the URL {current_url}: {e}")
 
+            if len(visited_urls) >= max_links:
+                logger.info(f"Reached the maximum number of links to scrape ({max_links})")
+                break
+
         conn.commit()
 
+    # Add these lines to check the database content after scraping
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM applications")
+        app_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM modules")
+        module_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM functions")
+        function_count = cursor.fetchone()[0]
+
     logger.info(f"Crawling completed. Visited {len(visited_urls)} pages.")
-    return {"message": "Crawling completed successfully.", "pages_visited": len(visited_urls)}
+    logger.info(f"Database content: {app_count} applications, {module_count} modules, {function_count} functions")
+    return {
+        "message": "Crawling completed successfully.",
+        "pages_visited": len(visited_urls),
+        "database_content": {
+            "applications": app_count,
+            "modules": module_count,
+            "functions": function_count
+        }
+    }
 
 def extract_app_info(soup, cursor):
     sidebar_project_name = soup.find('a', class_='sidebar-projectName')
@@ -75,12 +88,13 @@ def extract_app_info(soup, cursor):
     version = sidebar_project_version.text.strip() if sidebar_project_version else "Unknown"
 
     description = ""
-    reactor_h1 = soup.find('h1', string=app_name)
-    if reactor_h1:
-        description_p = reactor_h1.find_next('p')
-        if description_p:
-            description = description_p.text.strip()
+    content_div = soup.find('div', id='content')
+    if content_div:
+        first_p = content_div.find('p')
+        if first_p:
+            description = first_p.text.strip()
 
+    logger.debug(f"Inserting application: {app_name}, {version}, {description}")
     cursor.execute("""
         INSERT INTO applications (name, version, description) VALUES (?, ?, ?)
     """, (app_name, version, description))
@@ -119,83 +133,78 @@ def extract_hexdoc_links(soup, base_url, library_path):
     return new_links
 
 def extract_module_info(soup, url, app_id, cursor):
-    module_name = soup.find('h1').text.strip() if soup.find('h1') else "Unknown Module"
-    description = soup.find('section', class_='docstring').text.strip() if soup.find('section', class_='docstring') else ""
+    # The module name is usually in the first h1 tag
+    h1_tag = soup.find('h1')
+    if h1_tag:
+        module_name = h1_tag.text.strip().split(' –')[0]  # Remove the app name if present
+    else:
+        module_name = "Unknown Module"
+    
+    # The module description is usually in the section with id="moduledoc"
+    moduledoc = soup.find('section', id='moduledoc')
+    description = moduledoc.text.strip() if moduledoc else ""
 
+    logger.debug(f"Inserting module: {module_name}, {url}, {description[:100]}...")
     cursor.execute("""
         INSERT INTO modules (application_id, name, url, description) VALUES (?, ?, ?, ?)
     """, (app_id, module_name, url, description))
     module_id = cursor.lastrowid
 
     logger.info(f"Inserted module: {module_name} (ID: {module_id})")
-    return {"id": module_id, "name": module_name, "url": url, "description": description}
 
-def extract_function_info(func_section, module_id, cursor):
-    header = func_section.find('h2')
-    if not header:
-        return None
+    # Extract functions for this module
+    functions = extract_functions(soup, module_id, cursor)
+    logger.info(f"Extracted {len(functions)} functions for module {module_name}")
 
-    name_arity = header.text.strip().split('/')
-    name = name_arity[0]
-    arity = int(name_arity[1]) if len(name_arity) > 1 else 0
+    return {"id": module_id, "name": module_name, "url": url, "description": description, "functions": functions}
 
-    summary = func_section.find('p').text.strip() if func_section.find('p') else ""
-    description = func_section.find('section', class_='docstring').text.strip() if func_section.find('section', class_='docstring') else ""
+def extract_functions(soup, module_id, cursor):
+    functions = []
+    function_sections = soup.find_all('section', class_='detail')
+    
+    for section in function_sections:
+        header = section.find('h1', class_='signature')
+        if not header:
+            continue
 
-    cursor.execute("""
-        INSERT INTO functions (module_id, name, arity, summary, description)
-        VALUES (?, ?, ?, ?, ?)
-    """, (module_id, name, arity, summary, description))
-    function_id = cursor.lastrowid
+        full_name = header.text.strip()
+        name, arity = full_name.split('/', 1) if '/' in full_name else (full_name, '0')
+        arity = int(arity)
 
-    logger.info(f"Inserted function: {name}/{arity} (ID: {function_id})")
+        summary = ""
+        description = ""
+        docstring = section.find('section', class_='docstring')
+        if docstring:
+            summary_p = docstring.find('p')
+            if summary_p:
+                summary = summary_p.text.strip()
+            description = docstring.text.strip()
 
-    parameters = []
-    examples = []
+        logger.debug(f"Inserting function: {name}/{arity}, {summary[:50]}...")
+        cursor.execute("""
+            INSERT INTO functions (module_id, name, arity, summary, description)
+            VALUES (?, ?, ?, ?, ?)
+        """, (module_id, name, arity, summary, description))
+        function_id = cursor.lastrowid
 
-    # Extract parameters
-    params_section = func_section.find('section', class_='params')
-    if params_section:
-        param_items = params_section.find_all('li')
-        for param in param_items:
-            param_name = param.find('span', class_='name').text.strip()
-            param_type = param.find('span', class_='type').text.strip() if param.find('span', class_='type') else ""
-            param_desc = param.find('p').text.strip() if param.find('p') else ""
-            
-            cursor.execute("""
-                INSERT INTO parameters (function_id, name, type, description)
-                VALUES (?, ?, ?, ?)
-            """, (function_id, param_name, param_type, param_desc))
-            parameters.append({"name": param_name, "type": param_type, "description": param_desc})
+        # Extract parameters and examples here...
 
-    # Extract examples
-    examples_section = func_section.find('section', class_='examples')
-    if examples_section:
-        example_blocks = examples_section.find_all('pre')
-        for example in example_blocks:
-            code = example.text.strip()
-            description = example.find_previous_sibling('p').text.strip() if example.find_previous_sibling('p') else ""
-            
-            cursor.execute("""
-                INSERT INTO examples (function_id, code, description)
-                VALUES (?, ?, ?)
-            """, (function_id, code, description))
-            examples.append({"code": code, "description": description})
+        functions.append({
+            "id": function_id,
+            "name": name,
+            "arity": arity,
+            "summary": summary,
+            "description": description,
+            # Add parameters and examples here...
+        })
 
-    return {
-        "id": function_id,
-        "name": name,
-        "arity": arity,
-        "summary": summary,
-        "description": description,
-        "parameters": parameters,
-        "examples": examples
-    }
+    return functions
 
 def extract_guide_info(soup, url, app_id, cursor):
     guide_title = soup.find('h1').text.strip() if soup.find('h1') else "Unknown Guide"
     content = soup.find('div', id='content').text.strip() if soup.find('div', id='content') else ""
 
+    logger.debug(f"Inserting guide: {guide_title}, {url}, {content[:100]}...")
     cursor.execute("""
         INSERT INTO guides (application_id, title, url, content) VALUES (?, ?, ?, ?)
     """, (app_id, guide_title, url, content))

@@ -1,0 +1,113 @@
+
+
+# File: ./backend/app/database.py
+import sqlite3
+from contextlib import contextmanager
+
+DATABASE = "hexdocs.db"
+
+
+def initialize_database():
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag TEXT,
+        text TEXT,
+        link TEXT,
+        embedding BLOB
+    )
+    """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blog_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        content TEXT
+    )
+    """
+    )
+    conn.commit()
+    conn.close()
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# Add some sample data
+def add_sample_blog_posts():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM blog_posts")  # Clear existing data
+        cursor.execute("INSERT INTO blog_posts (title, content) VALUES (?, ?)",
+                       ("First Blog Post", "This is the content of the first blog post."))
+        cursor.execute("INSERT INTO blog_posts (title, content) VALUES (?, ?)",
+                       ("Second Blog Post", "This is the content of the second blog post."))
+        conn.commit()
+    print("Sample blog posts added successfully.")
+
+# This function will be called by our new poetry command
+def seed_database():
+    initialize_database()
+    add_sample_blog_posts()
+
+
+# File: ./backend/app/__init__.py
+from .database import initialize_database
+initialize_database()
+
+# File: ./backend/app/schemas.py
+from pydantic import BaseModel
+class BlogPost(BaseModel):
+    id: int
+    title: str
+    content: str
+
+# File: ./backend/app/main.py
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+from .database import get_db, initialize_database
+from .schemas import BlogPost
+
+initialize_database()
+
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Update this with your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/blog/{post_id}", response_model=BlogPost)
+def get_blog_post(post_id: int):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, content FROM blog_posts WHERE id = ?", (post_id,))
+        post = cursor.fetchone()
+        
+    if post is None:
+        raise HTTPException(status_code=404, detail="Blog post not found")
+    
+    return BlogPost(id=post[0], title=post[1], content=post[2])
+
+@app.get("/api/blog", response_model=List[BlogPost])
+def get_all_blog_posts():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, content FROM blog_posts")
+        posts = cursor.fetchall()
+    
+    return [BlogPost(id=post[0], title=post[1], content=post[2]) for post in posts]

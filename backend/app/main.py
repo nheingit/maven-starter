@@ -7,17 +7,17 @@ from .schemas import Application, Module, Function, Parameter, Example, ScrapeRe
 from .scraper import scrape_hexdoc
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 initialize_database()
 
 app = FastAPI()
 
-# Add CORS middleware
+# Update CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Update this with your frontend URL
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,6 +43,9 @@ def get_applications():
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, version, description FROM applications")
         apps = cursor.fetchall()
+    logger.info(f"Found {len(apps)} applications")
+    for app in apps:
+        logger.info(f"Application: ID={app[0]}, Name={app[1]}, Version={app[2]}")
     return [Application(id=app[0], name=app[1], version=app[2], description=app[3]) for app in apps]
 
 @app.get("/api/applications/{app_id}/modules", response_model=List[Module])
@@ -52,21 +55,27 @@ def get_modules(app_id: int):
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, description FROM modules WHERE application_id = ?", (app_id,))
         modules = cursor.fetchall()
+    logger.info(f"Found {len(modules)} modules for application ID: {app_id}")
+    for module in modules:
+        logger.info(f"Module: ID={module[0]}, Name={module[1]}, Description={module[2][:50]}...")
     return [Module(id=mod[0], name=mod[1], description=mod[2]) for mod in modules]
 
 @app.get("/api/modules/{module_id}/functions", response_model=List[Function])
 def get_functions(module_id: int):
     logger.info(f"Fetching functions for module ID: {module_id}")
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, name, arity, return_type, summary, description 
-            FROM functions WHERE module_id = ?
-        """, (module_id,))
-        functions = cursor.fetchall()
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, arity, return_type, summary, description 
+                FROM functions WHERE module_id = ?
+            """, (module_id,))
+            functions = cursor.fetchall()
+        logger.info(f"Found {len(functions)} functions for module ID: {module_id}")
         function_list = []
         for func in functions:
             function_id = func[0]
+            logger.info(f"Processing function: ID={function_id}, Name={func[1]}, Arity={func[2]}")
             # Get parameters
             cursor.execute("""
                 SELECT id, name, type, default_value, description
@@ -94,4 +103,7 @@ def get_functions(module_id: int):
                 examples=examples
             )
             function_list.append(function_item)
-    return function_list
+        return function_list
+    except Exception as e:
+        logger.error(f"Error fetching functions for module ID {module_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
